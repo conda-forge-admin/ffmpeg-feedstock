@@ -155,7 +155,22 @@ requirements:
 {% set grep = "findstr" %}  # [win]
 
 test:
+  files:
+    # smoke-test model for the openvino DNN backend, see
+    # recipe/test_models/generate_tiny_openvino_model.py
+    - test_models/tiny_openvino_model.xml
   requires:
+    # ffmpeg no longer depends on OpenVINO, so the runtime has to be pulled in
+    # explicitly to test that the dlopen path actually works. Inference needs
+    # three pieces: libopenvino (the C API we dlopen), the IR frontend (to
+    # parse the .xml) and a CPU plugin (to execute it). The CPU plugin is
+    # named per architecture.
+    - libopenvino                   # [not win and not ppc64le and not (osx and x86_64)]
+    - libopenvino-ir-frontend       # [not win and not ppc64le and not (osx and x86_64)]
+    - libopenvino-intel-cpu-plugin  # [linux64]
+    - libopenvino-arm-cpu-plugin    # [aarch64 or (osx and arm64)]
+    # to check the pixel values the inference test produces
+    - python                        # [not win and not ppc64le and not (osx and x86_64)]
     # we had a repodata patch that changed the compatibility from libxcb
     # to encompass 1.16 and 1.17, for some reason build 0 of ffmpeg 7.1
     # is only compatibile with libxcb 1.16
@@ -173,6 +188,16 @@ test:
     - ffmpeg -hide_banner -codecs | {{ grep }} "vaapi"            # [linux64]
     - ffmpeg -hide_banner -codecs | {{ grep }} "libaom"
     - ffmpeg -hide_banner -codecs | {{ grep }} "libsvtav1"
+    # The openvino DNN backend resolves the OpenVINO C API with dlopen, so
+    # exercise it for real: push one frame through a tiny model that doubles
+    # every sample. This covers the whole path -- dlopen, symbol resolution,
+    # ov_core_read_model, compile, and an actual inference -- rather than just
+    # proving the library can be opened.
+    # The model is statically shaped 1x3x64x64 NCHW, hence the scale filter.
+    - ffmpeg -hide_banner -f lavfi -i color=c=gray:s=64x64:d=1:r=1 -vf scale=64:64,format=rgb24,dnn_processing=dnn_backend=openvino:model=test_models/tiny_openvino_model.xml:input=input:output=output -frames:v 1 -f rawvideo -pix_fmt rgb24 dnn_out.raw  # [not win and not ppc64le and not (osx and x86_64)]
+    # gray (128) doubled and clamped is white (255); if inference silently did
+    # not run the frame would still be 128, so check the actual pixel value.
+    - python -c "d=open('dnn_out.raw','rb').read(); assert len(d)==64*64*3, len(d); assert set(d)=={255}, sorted(set(d))[:8]"  # [not win and not ppc64le and not (osx and x86_64)]
     # Verify ffplay is available
     - ffplay -version
     # Verify dynamic libraries on all systems
