@@ -1,0 +1,192 @@
+From dc79f313c1938f83cf73e0039cedd51bdb3e56bc Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Sat, 29 Aug 2026 10:09:54 -0400
+Subject: [PATCH] avfilter/dnn: allow loading the OpenVINO C API with dlopen
+
+OpenVINO encodes its release into the SONAME of its libraries
+(libopenvino_c.so.2630 for 2026.3.0), so linking against it at build time
+makes every OpenVINO release an ABI break for FFmpeg, and makes OpenVINO a
+hard runtime dependency of libavfilter even for users who never touch the
+DNN filters.
+
+Add --enable-libopenvino-dlopen, which compiles against the OpenVINO
+headers but resolves the C API at runtime instead of linking against it.
+The SONAME to load is derived from the version reported by pkg-config, and
+can be overridden with --libopenvino-libname for unusual layouts.
+
+The symbols are resolved once, on the first attempt to load a DNN model;
+if the OpenVINO runtime is not installed the openvino backend reports a
+clear error and the rest of FFmpeg is unaffected.
+
+The symbol table itself lives in dnn_backend_openvino_sym.h, which is
+generated from the OpenVINO headers being compiled against so that it
+cannot drift out of sync with the API.
+---
+ configure                              | 34 +++++++++++++
+ libavfilter/dnn/dnn_backend_openvino.c | 66 ++++++++++++++++++++++++++
+ 2 files changed, 100 insertions(+)
+
+diff --git a/configure b/configure
+index 374bd5c151..6c7a63c9a3 100755
+--- a/configure
++++ b/configure
+@@ -262,6 +262,9 @@ External library support:
+   --enable-libopencolorio  enable color management via OpenColorIO [no]
+   --enable-libopenvino     enable OpenVINO as a DNN module backend
+                            for DNN based filters like dnn_processing [no]
++  --enable-libopenvino-dlopen
++                           resolve the OpenVINO C API at runtime with dlopen()
++                           instead of linking against it [no]
+   --enable-libopus         enable Opus de/encoding via libopus [no]
+   --enable-libplacebo      enable libplacebo library [no]
+   --enable-libpulse        enable Pulseaudio input via libpulse [no]
+@@ -2215,6 +2218,7 @@ FEATURE_LIST="
+     ftrapv
+     gray
+     hardcoded_tables
++    libopenvino_dlopen
+     runtime_cpudetect
+     safe_bitstream_reader
+     shared
+@@ -2915,6 +2919,7 @@ CMDLINE_SET="
+     ignore_tests
+     install
+     ld
++    libopenvino_libname
+     ln_s
+     logfile
+     malloc_prefix
+@@ -3084,6 +3089,8 @@ dovi_rpudec_select="golomb"
+ dovi_rpuenc_select="golomb"
+ dnn_deps="avformat swscale"
+ dnn_deps_any="libtensorflow libopenvino libtorch libonnxruntime"
++libopenvino_dlopen_deps="libopenvino"
++libopenvino_dlopen_deps_any="libdl LoadLibrary"
+ error_resilience_select="me_cmp"
+ evcparse_select="golomb"
+ faandct_deps="faan"
+@@ -7414,6 +7421,30 @@ enabled libopenmpt        && require_pkg_config libopenmpt "libopenmpt >= 0.2.65
+ enabled libopenvino       && { { check_pkg_config libopenvino openvino openvino/c/openvino.h ov_core_create && enable openvino2; } ||
+                                 { check_pkg_config libopenvino openvino c_api/ie_c_api.h ie_c_api_version ||
+                                   require libopenvino c_api/ie_c_api.h ie_c_api_version -linference_engine_c_api; } }
++
++if enabled libopenvino_dlopen; then
++    enabled openvino2 ||
++        die "ERROR: --enable-libopenvino-dlopen needs --enable-libopenvino and the OpenVINO 2.0 C API"
++    if test -z "$libopenvino_libname"; then
++        libopenvino_modversion=$($pkg_config $pkg_config_flags --modversion openvino 2>/dev/null)
++        test -n "$libopenvino_modversion" ||
++            die "ERROR: cannot determine the OpenVINO version, pass --libopenvino-libname=NAME"
++        # OpenVINO encodes its release into the SONAME as
++        # (major % 100)(minor)(patch), e.g. 2026.3.0 -> 2630.
++        libopenvino_soversion=$(echo $libopenvino_modversion |
++                                awk -F. '{ printf "%d%d%d", $1 % 100, $2, $3 }')
++        case $target_os in
++            win32|win64|mingw32*|mingw64*|cygwin*)
++                libopenvino_libname="openvino_c.dll"                             ;;
++            darwin)
++                libopenvino_libname="libopenvino_c.$libopenvino_soversion.dylib" ;;
++            *)
++                libopenvino_libname="libopenvino_c.so.$libopenvino_soversion"    ;;
++        esac
++    fi
++    # The C API is resolved at runtime, so nothing must link against it.
++    libopenvino_extralibs=""
++fi
+ enabled libopus           && {
+     enabled libopus_decoder && {
+         require_pkg_config libopus opus opus_multistream.h opus_multistream_decoder_create
+@@ -8781,6 +8812,9 @@ cat > $TMPH <<EOF
+ #define SWS_MAX_FILTER_SIZE $sws_max_filter_size
+ EOF
+ 
++enabled libopenvino_dlopen &&
++    echo "#define OPENVINO_C_LIBNAME \"$(c_escape $libopenvino_libname)\"" >>$TMPH
++
+ test -n "$assert_level" &&
+     echo "#define ASSERT_LEVEL $assert_level" >>$TMPH
+ 
+diff --git a/libavfilter/dnn/dnn_backend_openvino.c b/libavfilter/dnn/dnn_backend_openvino.c
+index 764e8dabb5..20a6208114 100644
+--- a/libavfilter/dnn/dnn_backend_openvino.c
++++ b/libavfilter/dnn/dnn_backend_openvino.c
+@@ -39,6 +39,67 @@
+ #endif
+ #include "dnn_backend_common.h"
+ 
++#if CONFIG_LIBOPENVINO_DLOPEN
++#include "compat/w32dlfcn.h"
++#include "libavutil/thread.h"
++
++/* The OpenVINO C API is __cdecl on Windows, so the pointers must match. */
++#ifdef _WIN32
++#define OV_CALL __cdecl
++#else
++#define OV_CALL
++#endif
++
++#define OV_SYM(ret, name, args) static ret (OV_CALL *ff_ ## name) args;
++#include "dnn_backend_openvino_sym.h"
++
++static AVOnce dnn_openvino_load_once = AV_ONCE_INIT;
++static int    dnn_openvino_load_ret  = AVERROR_BUG;
++
++static void dnn_openvino_load_symbols(void)
++{
++    const char *missing = NULL;
++    void *handle;
++
++    handle = dlopen(OPENVINO_C_LIBNAME, RTLD_NOW | RTLD_LOCAL);
++    if (!handle) {
++        dnn_openvino_load_ret = AVERROR(ENOSYS);
++        return;
++    }
++
++#define OV_SYM(ret, name, args)                                              \
++    if (!missing && !(ff_ ## name = (ret (OV_CALL *)args)dlsym(handle, #name))) \
++        missing = #name;
++#include "dnn_backend_openvino_sym.h"
++
++    if (missing) {
++        av_log(NULL, AV_LOG_ERROR, "%s does not provide %s, it is too old for "
++               "this build of FFmpeg.\n", OPENVINO_C_LIBNAME, missing);
++        dlclose(handle);
++        dnn_openvino_load_ret = AVERROR(ENOSYS);
++        return;
++    }
++
++    /* The handle is intentionally kept for the lifetime of the process:
++     * OpenVINO registers plugins on load and cannot be safely unloaded. */
++    dnn_openvino_load_ret = 0;
++}
++
++static int dnn_openvino_load_library(void *log_ctx)
++{
++    ff_thread_once(&dnn_openvino_load_once, dnn_openvino_load_symbols);
++    if (dnn_openvino_load_ret < 0)
++        av_log(log_ctx, AV_LOG_ERROR, "Could not load the OpenVINO runtime "
++               "(%s). Install OpenVINO to use the openvino DNN backend.\n",
++               OPENVINO_C_LIBNAME);
++    return dnn_openvino_load_ret;
++}
++
++/* Redirect the call sites below onto the dynamically resolved entry points. */
++#define OV_SYM_REDIRECT
++#include "dnn_backend_openvino_sym.h"
++#endif /* CONFIG_LIBOPENVINO_DLOPEN */
++
+ typedef struct OVModel{
+     DNNModel model;
+     DnnContext *ctx;
+@@ -1378,6 +1439,11 @@ static DNNModel *dnn_load_model_ov(DnnContext *ctx, DNNFunctionType func_type, A
+     IEStatusCode status;
+ #endif
+ 
++#if CONFIG_LIBOPENVINO_DLOPEN
++    if (dnn_openvino_load_library(ctx) < 0)
++        return NULL;
++#endif
++
+     ov_model = av_mallocz(sizeof(OVModel));
+     if (!ov_model)
+         return NULL;

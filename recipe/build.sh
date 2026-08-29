@@ -146,6 +146,22 @@ if [[ "${target_platform}" == linux-ppc64le ]] || [[ "${target_platform}" == win
     extra_args="${extra_args} --disable-libopenvino"
 else
     extra_args="${extra_args} --enable-libopenvino"
+    # OpenVINO puts its release in the SONAME (libopenvino_c.so.2630 for
+    # 2026.3.0), so linking against it would make every OpenVINO release an
+    # ABI break for us and would make OpenVINO a hard runtime dependency of
+    # ffmpeg. Resolve the C API with dlopen instead: we still build against
+    # the headers, but libopenvino only has to be present at run time for
+    # those who actually use the DNN filters. See run_constrained in
+    # meta.yaml, which keeps the two in sync when OpenVINO *is* installed.
+    extra_args="${extra_args} --enable-libopenvino-dlopen"
+
+    # The dlopen loader needs a table of every ov_* entry point the backend
+    # calls. Generate it from the OpenVINO headers we are compiling against
+    # so it can never drift out of sync with the API.
+    ${PYTHON:-python} "${RECIPE_DIR}/symbol_generation/gen_openvino_syms.py" \
+        --include-dir "${PREFIX}/include" \
+        --backend-source libavfilter/dnn/dnn_backend_openvino.c \
+        --output libavfilter/dnn/dnn_backend_openvino_sym.h
 fi
 
 if [[ "${license_family}" == "gpl" ]]; then

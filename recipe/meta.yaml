@@ -42,7 +42,14 @@ source:
     # https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/24019
     - patches/0007-avcodec-nvenc-fix-double-free-of-the-input-buffer.patch
 
-{% set build = 1 %}
+    # Resolve the OpenVINO C API with dlopen instead of linking against it,
+    # so that OpenVINO becomes an optional runtime dependency rather than a
+    # hard one. OpenVINO puts its release in the SONAME, so linking made
+    # every OpenVINO release an ABI break for ffmpeg.
+    # Not yet submitted upstream.
+    - patches/0008-avfilter-dnn-allow-loading-the-OpenVINO-C-API-with-d.patch
+
+{% set build = 2 %}
 {% set build = build | int + build_number_increment | int %}
 {% if license_family == 'gpl' %}
     {% set build = build + 100 %}
@@ -57,6 +64,13 @@ build:
     - {{ pin_subpackage('ffmpeg', max_pin='x') }}
   ignore_run_exports_from:
     - glib
+    # The OpenVINO C API is resolved with dlopen at runtime (see build.sh),
+    # so nothing links against it and it must not become a hard runtime
+    # dependency -- that would drag the whole OpenVINO stack (13 packages)
+    # into every ffmpeg install. The version we built against is expressed
+    # as a run_constrained entry below instead.
+    - libopenvino-dev    # [not win and not ppc64le and not (osx and x86_64)]
+    - libopenvino        # [not win and not ppc64le and not (osx and x86_64)]
 
 requirements:
   build:
@@ -71,6 +85,9 @@ requirements:
     - nasm
     - make  # [not win]
     - m2-sed  # [win]
+    # generates the OpenVINO dlopen symbol table, see
+    # recipe/symbol_generation/gen_openvino_syms.py
+    - python
     # makedef uses the printf command which is provided by coreutils
     # - m2-coreutils  # [win]
     - shaderc
@@ -108,6 +125,9 @@ requirements:
     # libopenvino is no longer available for osx-64.
     # https://github.com/openvinotoolkit/openvino/releases/tag/2026.1.0
     - libopenvino-dev    # [not win and not ppc64le and not (osx and x86_64)]
+    # only for the headers and for pin_compatible below; the C API itself is
+    # resolved with dlopen, so this is not linked against.
+    - libopenvino        # [not win and not ppc64le and not (osx and x86_64)]
     - dav1d
     - liblzma-devel
     - sdl2
@@ -125,6 +145,11 @@ requirements:
     - libwebp
   run_constrained:
     - __cuda  >={{ cuda_version_for_ffnvcodec }}  # [ffnvcodec_headers != "None"]
+    # ffmpeg dlopens libopenvino_c.so.<soversion>, and OpenVINO encodes its
+    # release into that name (2026.3.0 -> libopenvino_c.so.2630). OpenVINO is
+    # therefore optional -- install it only to use the DNN filters -- but if
+    # it is installed it has to be the release we built against.
+    - {{ pin_compatible('libopenvino', max_pin='x.x.x') }}  # [not win and not ppc64le and not (osx and x86_64)]
 
 {% set grep = "grep" %}  # [unix]
 {% set grep = "findstr" %}  # [win]
