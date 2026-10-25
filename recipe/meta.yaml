@@ -42,10 +42,6 @@ source:
     # https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/24019
     - patches/0007-avcodec-nvenc-fix-double-free-of-the-input-buffer.patch
 
-    # h264/hevc_videotoolbox return every packet one call late, even with
-    # AV_CODEC_FLAG_LOW_DELAY and no B-frames: nothing waits for the frame
-    # just sent before popping the output queue. Suggested upstream, not yet
-    # merged.
     # https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/25451
     - patches/0008-avcodec-videotoolboxenc-wait-for-the-encoded-frame-in-low-delay.patch
 
